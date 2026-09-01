@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -10,6 +11,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+
 
 # ============================================================
 # CONFIGURAÇÃO
@@ -21,8 +23,11 @@ BASE_DIR = Path("recon_results") / TARGET.replace("/", "_")
 
 THREADS = 30
 
-# NÃO COPIAR WORDLISTS.
-# O script apenas referencia os arquivos originais.
+# Timeout padrão por ferramenta
+DEFAULT_TIMEOUT = 3600
+
+# Não copiar wordlists.
+# Todas permanecem nos locais originais.
 SECLists = Path("/opt/SecLists")
 
 WORDLIST_SOURCES = {
@@ -47,6 +52,7 @@ WORDLIST_SOURCES = {
     ],
 }
 
+
 # ============================================================
 # ESTRUTURA
 # ============================================================
@@ -68,15 +74,18 @@ DIRS = {
     "13_reports": BASE_DIR / "13_reports",
 }
 
+
 for directory in DIRS.values():
     directory.mkdir(parents=True, exist_ok=True)
+
 
 REPORT = DIRS["13_reports"] / "REPORT.md"
 COMMAND_LOG = DIRS["13_reports"] / "commands.log"
 CHECKPOINT = DIRS["13_reports"] / "checkpoint.json"
 
+
 # ============================================================
-# ESTADO
+# ESTADO GLOBAL
 # ============================================================
 
 STOP_REQUESTED = False
@@ -86,23 +95,36 @@ def now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def log(message):
-    print(f"[{now()}] {message}", flush=True)
-
-
 def banner(message):
     print()
-    print("=" * 78)
+    print("=" * 82)
     print(message)
-    print("=" * 78)
+    print("=" * 82)
     print(flush=True)
+
+
+def log(message):
+    print(f"[{now()}] {message}", flush=True)
 
 
 def command_exists(command):
     return shutil.which(command) is not None
 
 
+def safe_name(value):
+    return re.sub(
+        r"[^A-Za-z0-9_.-]",
+        "_",
+        str(value)
+    )
+
+
+# ============================================================
+# ARQUIVOS
+# ============================================================
+
 def write_file(path, content):
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     path.write_text(
@@ -113,6 +135,7 @@ def write_file(path, content):
 
 
 def append_file(path, content):
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     with path.open(
@@ -123,7 +146,25 @@ def append_file(path, content):
         f.write(content)
 
 
+def read_text(path):
+    path = Path(path)
+
+    if not path.exists():
+        return ""
+
+    try:
+        return path.read_text(
+            encoding="utf-8",
+            errors="ignore"
+        )
+    except Exception:
+        return ""
+
+
 def clean_lines(text):
+    if not text:
+        return []
+
     return sorted(
         set(
             line.strip()
@@ -134,14 +175,8 @@ def clean_lines(text):
 
 
 def read_lines(path):
-    if not path.exists():
-        return []
-
     return clean_lines(
-        path.read_text(
-            encoding="utf-8",
-            errors="ignore"
-        )
+        read_text(path)
     )
 
 
@@ -151,9 +186,9 @@ def save_unique(lines, path):
 
     cleaned = sorted(
         set(
-            x.strip()
+            str(x).strip()
             for x in lines
-            if x and x.strip()
+            if x is not None and str(x).strip()
         )
     )
 
@@ -166,6 +201,35 @@ def save_unique(lines, path):
     return cleaned
 
 
+def append_unique(lines, path):
+    existing = set(read_lines(path))
+
+    if isinstance(lines, str):
+        lines = lines.splitlines()
+
+    new_items = []
+
+    for item in lines:
+        item = str(item).strip()
+
+        if not item:
+            continue
+
+        if item not in existing:
+            existing.add(item)
+            new_items.append(item)
+
+    if new_items:
+        with Path(path).open(
+            "a",
+            encoding="utf-8"
+        ) as f:
+            for item in sorted(new_items):
+                f.write(item + "\n")
+
+    return sorted(existing)
+
+
 # ============================================================
 # CHECKPOINT
 # ============================================================
@@ -175,20 +239,31 @@ def load_checkpoint():
         return {
             "target": TARGET,
             "started": now(),
+            "updated": now(),
             "stages": {},
             "tools": {}
         }
 
     try:
-        return json.loads(
+        state = json.loads(
             CHECKPOINT.read_text(
                 encoding="utf-8"
             )
         )
+
+        state.setdefault("target", TARGET)
+        state.setdefault("stages", {})
+        state.setdefault("tools", {})
+
+        return state
+
     except Exception:
+        log("[WARN] checkpoint inválido. Criando novo estado.")
+
         return {
             "target": TARGET,
             "started": now(),
+            "updated": now(),
             "stages": {},
             "tools": {}
         }
@@ -199,6 +274,11 @@ STATE = load_checkpoint()
 
 def save_checkpoint():
     STATE["updated"] = now()
+
+    CHECKPOINT.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
     tmp = CHECKPOINT.with_suffix(".tmp")
 
@@ -218,17 +298,28 @@ def tool_key(stage, tool):
     return f"{stage}:{tool}"
 
 
-def is_tool_done(stage, tool):
-    return STATE.get("tools", {}).get(
+def get_tool_state(stage, tool):
+    return STATE.get(
+        "tools",
+        {}
+    ).get(
         tool_key(stage, tool),
         {}
-    ).get("status") == "DONE"
+    )
+
+
+def is_tool_done(stage, tool):
+    return (
+        get_tool_state(stage, tool)
+        .get("status") == "DONE"
+    )
 
 
 def mark_tool_running(stage, tool):
-    STATE.setdefault("tools", {})[
-        tool_key(stage, tool)
-    ] = {
+    STATE.setdefault(
+        "tools",
+        {}
+    )[tool_key(stage, tool)] = {
         "status": "RUNNING",
         "started": now()
     }
@@ -245,17 +336,19 @@ def mark_tool_done(stage, tool, output=None):
     if output:
         data["output"] = str(output)
 
-    STATE.setdefault("tools", {})[
-        tool_key(stage, tool)
-    ] = data
+    STATE.setdefault(
+        "tools",
+        {}
+    )[tool_key(stage, tool)] = data
 
     save_checkpoint()
 
 
 def mark_tool_failed(stage, tool, reason=""):
-    STATE.setdefault("tools", {})[
-        tool_key(stage, tool)
-    ] = {
+    STATE.setdefault(
+        "tools",
+        {}
+    )[tool_key(stage, tool)] = {
         "status": "FAILED",
         "finished": now(),
         "reason": reason
@@ -264,15 +357,37 @@ def mark_tool_failed(stage, tool, reason=""):
     save_checkpoint()
 
 
-def stage_done(stage):
+def stage_status(stage):
     return STATE.get(
         "stages",
         {}
-    ).get(stage, {}).get("status") == "DONE"
+    ).get(
+        stage,
+        {}
+    ).get("status")
+
+
+def stage_done(stage):
+    return stage_status(stage) == "DONE"
+
+
+def mark_stage_running(stage):
+    STATE.setdefault(
+        "stages",
+        {}
+    )[stage] = {
+        "status": "RUNNING",
+        "started": now()
+    }
+
+    save_checkpoint()
 
 
 def mark_stage_done(stage):
-    STATE.setdefault("stages", {})[stage] = {
+    STATE.setdefault(
+        "stages",
+        {}
+    )[stage] = {
         "status": "DONE",
         "finished": now()
     }
@@ -280,8 +395,21 @@ def mark_stage_done(stage):
     save_checkpoint()
 
 
+def mark_stage_failed(stage, reason=""):
+    STATE.setdefault(
+        "stages",
+        {}
+    )[stage] = {
+        "status": "FAILED",
+        "finished": now(),
+        "reason": reason
+    }
+
+    save_checkpoint()
+
+
 # ============================================================
-# SINAL
+# SIGNAL
 # ============================================================
 
 def signal_handler(signum, frame):
@@ -289,16 +417,27 @@ def signal_handler(signum, frame):
 
     STOP_REQUESTED = True
 
-    log("INTERRUPÇÃO SOLICITADA.")
-    log("Checkpoint salvo. O próximo início continuará daqui.")
+    log("")
+    log("======================================================")
+    log("INTERRUPÇÃO SOLICITADA")
+    log("Checkpoint preservado.")
+    log("A próxima execução continuará a partir do estado salvo.")
+    log("======================================================")
 
 
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(
+    signal.SIGINT,
+    signal_handler
+)
+
+signal.signal(
+    signal.SIGTERM,
+    signal_handler
+)
 
 
 # ============================================================
-# EXECUÇÃO DE FERRAMENTAS
+# EXECUÇÃO DE COMANDOS
 # ============================================================
 
 def run_cmd(
@@ -306,49 +445,87 @@ def run_cmd(
     tool,
     cmd,
     output_file=None,
-    timeout=1800
+    timeout=DEFAULT_TIMEOUT,
+    stdin_text=None,
+    allow_failure=False
 ):
     """
-    Uma ferramenta = uma unidade de checkpoint.
+    Executa uma ferramenta como unidade independente.
 
-    Se o processo for interrompido:
-    - NÃO marca DONE
-    - o próximo início executará novamente essa ferramenta.
+    Características:
+    - checkpoint individual;
+    - saída em tempo real;
+    - nome da ferramenta no terminal;
+    - timeout;
+    - recuperação após interrupção;
+    - logging do comando;
+    - saída opcional para arquivo.
+
+    Retorno:
+        texto produzido pela ferramenta.
     """
 
     global STOP_REQUESTED
 
     if is_tool_done(stage, tool):
-        log(f"[SKIP] [{tool}] checkpoint DONE")
+        log(
+            f"[SKIP] [{tool}] checkpoint DONE"
+        )
+
+        if output_file and Path(output_file).exists():
+            return read_text(output_file)
+
         return ""
 
-    if not command_exists(cmd[0]):
-        log(f"[AUSENTE] [{tool}] {cmd[0]}")
+    executable = cmd[0]
+
+    if not command_exists(executable):
+        log(
+            f"[AUSENTE] [{tool}] {executable}"
+        )
+
+        mark_tool_failed(
+            stage,
+            tool,
+            f"command not found: {executable}"
+        )
+
         return ""
 
-    mark_tool_running(stage, tool)
+    mark_tool_running(
+        stage,
+        tool
+    )
 
     command_string = " ".join(
-        str(x) for x in cmd
+        shlex.quote(str(x))
+        for x in cmd
     )
 
     banner(
         f"[FERRAMENTA] {tool}\n"
-        f"[ETAPA] {stage}\n"
-        f"[COMANDO] {command_string}"
+        f"[ETAPA]      {stage}\n"
+        f"[COMANDO]    {command_string}"
     )
 
     append_file(
         COMMAND_LOG,
-        f"\n[{now()}]\n"
-        f"[STAGE] {stage}\n"
-        f"[TOOL] {tool}\n"
-        f"$ {command_string}\n"
+        "\n"
+        + "=" * 82
+        + "\n"
+        + f"[{now()}]\n"
+        + f"[STAGE] {stage}\n"
+        + f"[TOOL] {tool}\n"
+        + f"$ {command_string}\n"
     )
+
+    process = None
+    output_lines = []
 
     try:
         process = subprocess.Popen(
             cmd,
+            stdin=subprocess.PIPE if stdin_text is not None else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -356,44 +533,62 @@ def run_cmd(
             bufsize=1
         )
 
-        output_lines = []
+        if stdin_text is not None:
+            try:
+                process.stdin.write(stdin_text)
+                process.stdin.close()
+            except Exception:
+                pass
 
         start_time = time.time()
 
         while True:
 
             if STOP_REQUESTED:
-                process.terminate()
 
                 try:
+                    process.terminate()
                     process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    process.kill()
+                except Exception:
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
 
                 append_file(
                     COMMAND_LOG,
-                    "\n[INTERRUPTED]\n"
+                    "[INTERRUPTED]\n"
                 )
 
                 log(
-                    f"[INTERRUPT] [{tool}] "
-                    "não foi marcado como concluído."
+                    f"[INTERRUPTED] [{tool}]"
                 )
 
+                # NÃO marca DONE.
+                # Próxima execução tentará novamente.
                 return ""
 
-            if time.time() - start_time > timeout:
-                process.kill()
+            if (
+                time.time() - start_time
+                > timeout
+            ):
+                try:
+                    process.kill()
+                except Exception:
+                    pass
 
-                log(
-                    f"[TIMEOUT] [{tool}] "
-                    f"limite={timeout}s"
+                reason = (
+                    f"timeout after {timeout}s"
                 )
 
                 mark_tool_failed(
                     stage,
                     tool,
-                    "timeout"
+                    reason
+                )
+
+                log(
+                    f"[TIMEOUT] [{tool}] {timeout}s"
                 )
 
                 return ""
@@ -401,9 +596,14 @@ def run_cmd(
             line = process.stdout.readline()
 
             if line:
-                line = line.rstrip()
 
-                output_lines.append(line)
+                line = line.rstrip(
+                    "\r\n"
+                )
+
+                output_lines.append(
+                    line
+                )
 
                 print(
                     f"[{tool}] {line}",
@@ -419,22 +619,31 @@ def run_cmd(
 
         returncode = process.returncode
 
-        output = "\n".join(output_lines)
+        output = "\n".join(
+            output_lines
+        )
 
         append_file(
             COMMAND_LOG,
-            output +
-            f"\n[exit={returncode}]\n"
+            output
+            + "\n"
+            + f"[exit={returncode}]\n"
         )
 
-        if output_file:
+        if output_file is not None:
+
             write_file(
                 output_file,
-                output +
-                ("\n" if output else "")
+                output
+                + (
+                    "\n"
+                    if output
+                    else ""
+                )
             )
 
         if returncode == 0:
+
             mark_tool_done(
                 stage,
                 tool,
@@ -446,28 +655,38 @@ def run_cmd(
             )
 
         else:
+
+            reason = (
+                f"exit={returncode}"
+            )
+
             mark_tool_failed(
                 stage,
                 tool,
-                f"exit={returncode}"
+                reason
             )
 
             log(
                 f"[FAILED] [{tool}] exit={returncode}"
             )
 
+            if not allow_failure:
+                return output
+
         return output
 
     except Exception as exc:
 
-        log(
-            f"[ERRO] [{tool}] {exc}"
-        )
+        reason = str(exc)
 
         mark_tool_failed(
             stage,
             tool,
-            str(exc)
+            reason
+        )
+
+        log(
+            f"[ERROR] [{tool}] {reason}"
         )
 
         return ""
@@ -478,7 +697,10 @@ def run_cmd(
 # ============================================================
 
 def prepare_wordlist_references():
-    banner("[WORDLISTS] Verificando referências")
+
+    banner(
+        "[WORDLISTS] REFERÊNCIAS"
+    )
 
     for category, sources in WORDLIST_SOURCES.items():
 
@@ -487,40 +709,47 @@ def prepare_wordlist_references():
         for path in sources:
 
             if path.exists():
-                valid.append(path)
+
+                valid.append(
+                    path
+                )
 
                 log(
-                    f"[WORDLIST] {category}: {path}"
+                    f"[WORDLIST] {category:<6} -> {path}"
                 )
+
             else:
+
                 log(
                     f"[WORDLIST AUSENTE] {path}"
                 )
 
-        # IMPORTANTE:
-        # O arquivo abaixo contém apenas caminhos.
-        # Não copia conteúdo das wordlists.
         reference_file = (
-            DIRS["00_wordlists"] /
-            f"{category}-sources.txt"
+            DIRS["00_wordlists"]
+            / f"{category}-sources.txt"
         )
 
         write_file(
             reference_file,
             "\n".join(
-                str(x)
-                for x in valid
-            ) +
-            ("\n" if valid else "")
+                str(path)
+                for path in valid
+            )
+            + (
+                "\n"
+                if valid
+                else ""
+            )
         )
 
         log(
             f"[WORDLIST] {category}: "
-            f"{len(valid)} arquivos referenciados"
+            f"{len(valid)} referência(s)"
         )
 
 
 def wordlist_paths(category):
+
     return [
         path
         for path in WORDLIST_SOURCES.get(
@@ -529,15 +758,6 @@ def wordlist_paths(category):
         )
         if path.exists()
     ]
-
-
-def first_wordlist(category):
-    paths = wordlist_paths(category)
-
-    if not paths:
-        return None
-
-    return str(paths[0])
 
 
 # ============================================================
@@ -557,24 +777,26 @@ def init_report():
 
 `{TARGET}`
 
-## Início
+## Started
 
 `{now()}`
 
-## Modelo
+## Architecture
 
-Reconhecimento sequencial com checkpoint individual por ferramenta.
+Sequential reconnaissance pipeline with individual
+tool checkpoints and automatic resume.
 
 ## Wordlists
 
-As wordlists são referenciadas diretamente em `/opt/SecLists`.
-Nenhuma wordlist é copiada para o diretório do alvo.
+Wordlists are referenced from their original locations.
+They are **not copied** into the target directory.
 
 """
     )
 
 
 def report_section(title):
+
     append_file(
         REPORT,
         f"\n\n## {title}\n\n"
@@ -582,10 +804,82 @@ def report_section(title):
 
 
 def report_line(text):
+
     append_file(
         REPORT,
         text + "\n"
     )
+
+
+# ============================================================
+# HOST / DOMAIN NORMALIZAÇÃO
+# ============================================================
+
+def normalize_hostname(value):
+
+    value = str(value).strip().lower()
+
+    value = re.sub(
+        r"^https?://",
+        "",
+        value
+    )
+
+    value = value.split(
+        "/",
+        1
+    )[0]
+
+    value = value.split(
+        ":",
+        1
+    )[0]
+
+    value = value.strip(
+        "."
+    )
+
+    return value
+
+
+def valid_target_hostname(host):
+
+    host = normalize_hostname(
+        host
+    )
+
+    if not host:
+        return False
+
+    if host == TARGET.lower():
+        return True
+
+    return host.endswith(
+        "." + TARGET.lower()
+    )
+
+
+def extract_ipv4(text):
+
+    found = set()
+
+    for ip in re.findall(
+        r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
+        text
+    ):
+
+        parts = ip.split(".")
+
+        try:
+            if all(
+                0 <= int(x) <= 255
+                for x in parts
+            ):
+                found.add(ip)
+        except Exception:
+            pass
+
+    return found
 
 
 # ============================================================
@@ -597,15 +891,23 @@ def stage_subdomains():
     stage = "01_subdomains"
 
     if stage_done(stage):
-        log(f"[SKIP] {stage} já concluída")
-        return
+        log(
+            f"[SKIP] {stage} -> DONE"
+        )
+        return True
 
-    banner("01 — SUBDOMAIN ENUMERATION")
+    mark_stage_running(
+        stage
+    )
+
+    banner(
+        "01 — SUBDOMAIN ENUMERATION"
+    )
 
     discovered = set()
 
     # --------------------------------------------------------
-    # subfinder
+    # SUBFINDER
     # --------------------------------------------------------
 
     out = run_cmd(
@@ -622,11 +924,13 @@ def stage_subdomains():
     )
 
     discovered.update(
-        clean_lines(out)
+        normalize_hostname(x)
+        for x in out.splitlines()
+        if valid_target_hostname(x)
     )
 
     # --------------------------------------------------------
-    # amass
+    # AMASS
     # --------------------------------------------------------
 
     out = run_cmd(
@@ -645,18 +949,15 @@ def stage_subdomains():
 
     for line in out.splitlines():
 
-        line = line.strip()
-
-        if re.match(
-            r"^[A-Za-z0-9._*-]+\." +
-            re.escape(TARGET) +
-            r"$",
+        host = normalize_hostname(
             line
-        ):
-            discovered.add(line)
+        )
+
+        if valid_target_hostname(host):
+            discovered.add(host)
 
     # --------------------------------------------------------
-    # chaos
+    # CHAOS
     # --------------------------------------------------------
 
     out = run_cmd(
@@ -671,12 +972,17 @@ def stage_subdomains():
         3600
     )
 
-    discovered.update(
-        clean_lines(out)
-    )
+    for line in out.splitlines():
+
+        host = normalize_hostname(
+            line
+        )
+
+        if valid_target_hostname(host):
+            discovered.add(host)
 
     # --------------------------------------------------------
-    # assetfinder
+    # ASSETFINDER
     # --------------------------------------------------------
 
     out = run_cmd(
@@ -691,12 +997,17 @@ def stage_subdomains():
         3600
     )
 
-    discovered.update(
-        clean_lines(out)
-    )
+    for line in out.splitlines():
+
+        host = normalize_hostname(
+            line
+        )
+
+        if valid_target_hostname(host):
+            discovered.add(host)
 
     # --------------------------------------------------------
-    # findomain
+    # FINDOMAIN
     # --------------------------------------------------------
 
     out = run_cmd(
@@ -712,15 +1023,25 @@ def stage_subdomains():
         3600
     )
 
-    discovered.update(
-        clean_lines(out)
+    for line in out.splitlines():
+
+        host = normalize_hostname(
+            line
+        )
+
+        if valid_target_hostname(host):
+            discovered.add(host)
+
+    # --------------------------------------------------------
+    # SUBLIST3R
+    # --------------------------------------------------------
+
+    sublist_output = (
+        DIRS[stage]
+        / "sublist3r.txt"
     )
 
-    # --------------------------------------------------------
-    # sublist3r
-    # --------------------------------------------------------
-
-    out = run_cmd(
+    run_cmd(
         stage,
         "sublist3r",
         [
@@ -728,82 +1049,123 @@ def stage_subdomains():
             "-d",
             TARGET,
             "-o",
-            str(DIRS[stage] / "sublist3r.txt")
+            str(sublist_output)
         ],
         None,
         3600
     )
 
-    discovered.update(
-        clean_lines(out)
-    )
+    for line in read_lines(
+        sublist_output
+    ):
+
+        host = normalize_hostname(
+            line
+        )
+
+        if valid_target_hostname(host):
+            discovered.add(host)
 
     # --------------------------------------------------------
     # DNSGEN
     # --------------------------------------------------------
 
-    seed_file = (
-        DIRS[stage] /
-        "dnsgen-input.txt"
+    dnsgen_input = (
+        DIRS[stage]
+        / "dnsgen-input.txt"
     )
 
-    if discovered:
-        save_unique(
-            discovered,
-            seed_file
-        )
+    save_unique(
+        discovered,
+        dnsgen_input
+    )
+
+    if discovered and command_exists("dnsgen"):
 
         out = run_cmd(
             stage,
             "dnsgen",
             [
                 "dnsgen",
-                str(seed_file)
+                str(dnsgen_input)
             ],
-            DIRS[stage] / "dnsgen-generated.txt",
+            DIRS[stage]
+            / "dnsgen-generated.txt",
             3600
         )
 
-        # dnsgen gera candidatos.
-        # Só adicionamos candidatos válidos ao conjunto.
+        for line in out.splitlines():
+
+            host = normalize_hostname(
+                line
+            )
+
+            if valid_target_hostname(host):
+                discovered.add(host)
+
+    # --------------------------------------------------------
+    # ANEW
+    # --------------------------------------------------------
+
+    all_file = (
+        DIRS[stage]
+        / "all-subdomains.txt"
+    )
+
+    if command_exists("anew"):
+
+        existing = read_text(
+            all_file
+        )
+
+        candidates = "\n".join(
+            sorted(discovered)
+        )
+
+        if candidates:
+
+            run_cmd(
+                stage,
+                "anew",
+                [
+                    "anew",
+                    str(all_file)
+                ],
+                None,
+                1800,
+                stdin_text=candidates + "\n",
+                allow_failure=True
+            )
+
         discovered.update(
-            clean_lines(out)
+            read_lines(all_file)
+        )
+
+    else:
+
+        save_unique(
+            discovered,
+            all_file
         )
 
     # --------------------------------------------------------
-    # normalização
+    # NORMALIZAÇÃO FINAL
     # --------------------------------------------------------
 
     normalized = set()
 
     for host in discovered:
 
-        host = host.lower().strip()
-
-        host = host.replace(
-            "http://",
-            ""
-        ).replace(
-            "https://",
-            ""
+        host = normalize_hostname(
+            host
         )
 
-        host = host.strip(".")
-
-        if (
-            host == TARGET or
-            host.endswith("." + TARGET)
-        ):
+        if valid_target_hostname(host):
             normalized.add(host)
-
-    subdomain_file = (
-        DIRS[stage] /
-        "all-subdomains.txt"
-    )
 
     save_unique(
         normalized,
-        subdomain_file
+        all_file
     )
 
     report_section(
@@ -811,13 +1173,24 @@ def stage_subdomains():
     )
 
     report_line(
-        f"**Subdomínios:** `{len(normalized)}`"
+        f"**Subdomains discovered:** `{len(normalized)}`"
     )
 
-    for host in sorted(normalized):
-        report_line(f"- `{host}`")
+    report_line("")
 
-    mark_stage_done(stage)
+    for host in sorted(normalized):
+        report_line(
+            f"- `{host}`"
+        )
+
+    if STOP_REQUESTED:
+        return False
+
+    mark_stage_done(
+        stage
+    )
+
+    return True
 
 
 # ============================================================
@@ -829,58 +1202,86 @@ def stage_dns():
     stage = "02_dns"
 
     if stage_done(stage):
-        log(f"[SKIP] {stage} já concluída")
-        return
+        log(
+            f"[SKIP] {stage} -> DONE"
+        )
+        return True
 
-    banner("02 — DNS ENUMERATION")
+    mark_stage_running(
+        stage
+    )
+
+    banner(
+        "02 — DNS RESOLUTION"
+    )
 
     subdomains = read_lines(
-        DIRS["01_subdomains"] /
-        "all-subdomains.txt"
+        DIRS["01_subdomains"]
+        / "all-subdomains.txt"
     )
 
     if not subdomains:
-        log("[DNS] Nenhum subdomínio disponível.")
-        mark_stage_done(stage)
-        return
 
-    input_file = (
-        DIRS[stage] /
-        "hosts.txt"
+        log(
+            "[DNS] Nenhum domínio disponível."
+        )
+
+        mark_stage_failed(
+            stage,
+            "no subdomains"
+        )
+
+        return False
+
+    hosts_file = (
+        DIRS[stage]
+        / "hosts.txt"
     )
 
     save_unique(
         subdomains,
-        input_file
+        hosts_file
     )
 
-    # dnsx
+    dnsx_file = (
+        DIRS[stage]
+        / "dnsx.txt"
+    )
 
-    run_cmd(
+    # --------------------------------------------------------
+    # DNSX
+    # --------------------------------------------------------
+
+    dnsx_output = run_cmd(
         stage,
         "dnsx",
         [
             "dnsx",
             "-l",
-            str(input_file),
+            str(hosts_file),
             "-a",
             "-aaaa",
             "-cname",
             "-resp",
             "-silent"
         ],
-        DIRS[stage] / "dnsx.txt",
-        3600
+        dnsx_file,
+        7200
     )
 
-    # shuffledns
+    # --------------------------------------------------------
+    # SHUFFLEDNS
+    # --------------------------------------------------------
 
-    dns_wordlists = wordlist_paths("dns")
+    dns_wordlists = wordlist_paths(
+        "dns"
+    )
 
-    if command_exists("shuffledns") and dns_wordlists:
+    if (
+        command_exists("shuffledns")
+        and dns_wordlists
+    ):
 
-        # shuffledns trabalha melhor com uma wordlist.
-        # Usamos a referência maior disponível.
         selected = max(
             dns_wordlists,
             key=lambda p: p.stat().st_size
@@ -897,13 +1298,88 @@ def stage_dns():
                 str(selected),
                 "-silent"
             ],
-            DIRS[stage] / "shuffledns.txt",
+            DIRS[stage]
+            / "shuffledns.txt",
             7200
         )
 
-    # massdns
+    # --------------------------------------------------------
+    # PUREDNS
+    # --------------------------------------------------------
+
+    if (
+        command_exists("puredns")
+        and dns_wordlists
+    ):
+
+        selected = max(
+            dns_wordlists,
+            key=lambda p: p.stat().st_size
+        )
+
+        resolvers = (
+            DIRS[stage]
+            / "resolvers.txt"
+        )
+
+        # Usa resolvers existentes no sistema.
+        resolver_candidates = []
+
+        resolv_conf = Path(
+            "/etc/resolv.conf"
+        )
+
+        if resolv_conf.exists():
+
+            for line in read_lines(
+                resolv_conf
+            ):
+
+                if line.startswith(
+                    "nameserver "
+                ):
+
+                    resolver_candidates.append(
+                        line.split()[1]
+                    )
+
+        save_unique(
+            resolver_candidates,
+            resolvers
+        )
+
+        if resolver_candidates:
+
+            run_cmd(
+                stage,
+                "puredns",
+                [
+                    "puredns",
+                    "bruteforce",
+                    str(selected),
+                    TARGET,
+                    "--resolvers",
+                    str(resolvers),
+                    "-w",
+                    str(
+                        DIRS[stage]
+                        / "puredns.txt"
+                    )
+                ],
+                None,
+                7200,
+                allow_failure=True
+            )
+
+    # --------------------------------------------------------
+    # MASSDNS
+    # --------------------------------------------------------
 
     if command_exists("massdns"):
+
+        massdns_resolvers = Path(
+            "/etc/resolv.conf"
+        )
 
         run_cmd(
             stage,
@@ -911,47 +1387,91 @@ def stage_dns():
             [
                 "massdns",
                 "-r",
-                "/usr/share/wordlists/dns.txt",
+                str(massdns_resolvers),
                 "-t",
                 "A",
                 "-o",
                 "S",
-                str(input_file)
+                str(hosts_file)
             ],
-            DIRS[stage] / "massdns.txt",
-            3600
+            DIRS[stage]
+            / "massdns.txt",
+            7200,
+            allow_failure=True
         )
 
-    # extrair IPv4 de dnsx/massdns
+    # --------------------------------------------------------
+    # IP EXTRACTION
+    # --------------------------------------------------------
 
     ips = set()
 
-    for result_file in [
-        DIRS[stage] / "dnsx.txt",
+    for source in [
+        dnsx_file,
         DIRS[stage] / "massdns.txt",
+        DIRS[stage] / "puredns.txt",
     ]:
 
-        for line in read_lines(result_file):
-
-            found = re.findall(
-                r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
-                line
+        ips.update(
+            extract_ipv4(
+                read_text(source)
             )
-
-            ips.update(found)
+        )
 
     save_unique(
         ips,
-        DIRS["03_ips"] / "ipv4.txt"
+        DIRS["03_ips"]
+        / "ipv4.txt"
     )
 
-    report_section("02 — DNS")
+    # --------------------------------------------------------
+    # RESOLVED HOSTS
+    # --------------------------------------------------------
+
+    resolved_hosts = set()
+
+    for line in read_lines(
+        dnsx_file
+    ):
+
+        host = normalize_hostname(
+            line.split()[0]
+            if line.split()
+            else line
+        )
+
+        if (
+            valid_target_hostname(host)
+            and extract_ipv4(line)
+        ):
+            resolved_hosts.add(host)
+
+    save_unique(
+        resolved_hosts,
+        DIRS[stage]
+        / "resolved-hosts.txt"
+    )
+
+    report_section(
+        "02 — DNS Resolution"
+    )
 
     report_line(
-        f"**IPv4 encontrados:** `{len(ips)}`"
+        f"**Resolved hosts:** `{len(resolved_hosts)}`"
     )
 
-    mark_stage_done(stage)
+    report_line(
+        f"**IPv4 addresses:** `{len(ips)}`"
+    )
+
+    if STOP_REQUESTED:
+        return False
+
+    mark_stage_done(
+        stage
+    )
+
+    return True
 
 
 # ============================================================
@@ -963,24 +1483,36 @@ def stage_ips():
     stage = "03_ips"
 
     if stage_done(stage):
-        log(f"[SKIP] {stage} já concluída")
-        return
+        log(
+            f"[SKIP] {stage} -> DONE"
+        )
+        return True
 
-    banner("03 — IP ENUMERATION")
+    mark_stage_running(
+        stage
+    )
+
+    banner(
+        "03 — IP CONSOLIDATION"
+    )
 
     ips = read_lines(
-        DIRS["03_ips"] /
-        "ipv4.txt"
+        DIRS["03_ips"]
+        / "ipv4.txt"
     )
 
     save_unique(
         ips,
-        DIRS["03_ips"] /
-        "all-ips.txt"
+        DIRS["03_ips"]
+        / "all-ips.txt"
     )
 
     report_section(
         "03 — IP Enumeration"
+    )
+
+    report_line(
+        f"**IPv4:** `{len(ips)}`"
     )
 
     for ip in ips:
@@ -988,7 +1520,11 @@ def stage_ips():
             f"- `{ip}`"
         )
 
-    mark_stage_done(stage)
+    mark_stage_done(
+        stage
+    )
+
+    return True
 
 
 # ============================================================
@@ -1000,111 +1536,129 @@ def stage_ports():
     stage = "04_ports"
 
     if stage_done(stage):
-        log(f"[SKIP] {stage} já concluída")
-        return
+        log(
+            f"[SKIP] {stage} -> DONE"
+        )
+        return True
 
-    banner("04 — PORT ENUMERATION")
+    mark_stage_running(
+        stage
+    )
 
-    subdomains = read_lines(
-        DIRS["01_subdomains"] /
-        "all-subdomains.txt"
+    banner(
+        "04 — PORT ENUMERATION"
     )
 
     ips = read_lines(
-        DIRS["03_ips"] /
-        "ipv4.txt"
+        DIRS["03_ips"]
+        / "all-ips.txt"
     )
 
-    if subdomains and command_exists("naabu"):
+    if not ips:
 
-        targets = (
-            DIRS[stage] /
-            "targets.txt"
+        log(
+            "[PORTS] Nenhum IP resolvido."
         )
 
-        save_unique(
-            subdomains,
-            targets
+        report_section(
+            "04 — Port Enumeration"
         )
 
-        run_cmd(
-            stage,
+        report_line(
+            "**No resolved IPs available. Port scanning skipped.**"
+        )
+
+        mark_stage_done(
+            stage
+        )
+
+        return True
+
+    ip_file = (
+        DIRS[stage]
+        / "targets.txt"
+    )
+
+    save_unique(
+        ips,
+        ip_file
+    )
+
+    # --------------------------------------------------------
+    # NAABU
+    # --------------------------------------------------------
+
+    run_cmd(
+        stage,
+        "naabu",
+        [
             "naabu",
-            [
-                "naabu",
-                "-list",
-                str(targets),
-                "-top-ports",
-                "1000",
-                "-silent"
-            ],
-            DIRS[stage] /
-            "naabu-top1000.txt",
-            7200
-        )
+            "-list",
+            str(ip_file),
+            "-top-ports",
+            "1000",
+            "-silent"
+        ],
+        DIRS[stage]
+        / "naabu-top1000.txt",
+        7200
+    )
 
-    if ips and command_exists("nmap"):
+    # --------------------------------------------------------
+    # NMAP
+    # --------------------------------------------------------
 
-        ip_file = (
-            DIRS[stage] /
-            "ips.txt"
-        )
-
-        save_unique(
-            ips,
-            ip_file
-        )
-
-        run_cmd(
-            stage,
+    run_cmd(
+        stage,
+        "nmap",
+        [
             "nmap",
-            [
-                "nmap",
-                "-sV",
-                "--open",
-                "-T3",
-                "-iL",
-                str(ip_file)
-            ],
-            DIRS[stage] /
-            "nmap-services.txt",
-            7200
-        )
+            "-sV",
+            "--open",
+            "-T3",
+            "-iL",
+            str(ip_file)
+        ],
+        DIRS[stage]
+        / "nmap-services.txt",
+        7200
+    )
 
-    if ips and command_exists("masscan"):
+    # --------------------------------------------------------
+    # MASSCAN
+    # --------------------------------------------------------
 
-        ip_file = (
-            DIRS[stage] /
-            "masscan-ips.txt"
-        )
-
-        save_unique(
-            ips,
-            ip_file
-        )
-
-        run_cmd(
-            stage,
+    run_cmd(
+        stage,
+        "masscan",
+        [
             "masscan",
-            [
-                "masscan",
-                "-iL",
-                str(ip_file),
-                "--top-ports",
-                "1000",
-                "--rate",
-                "1000"
-            ],
-            DIRS[stage] /
-            "masscan.txt",
-            7200
-        )
+            "-iL",
+            str(ip_file),
+            "--top-ports",
+            "1000",
+            "--rate",
+            "1000"
+        ],
+        DIRS[stage]
+        / "masscan.txt",
+        7200,
+        allow_failure=True
+    )
 
     report_section(
         "04 — Port Enumeration"
     )
 
-    mark_stage_done(stage)
+    report_line(
+        f"**IPs scanned:** `{len(ips)}`"
+    )
+
+    mark_stage_done(
+        stage
+    )
+
+    return True
 
 
 # ============================================================
@@ -1116,26 +1670,34 @@ def stage_services():
     stage = "05_services"
 
     if stage_done(stage):
-        log(f"[SKIP] {stage} já concluída")
-        return
+        log(
+            f"[SKIP] {stage} -> DONE"
+        )
+        return True
 
-    banner("05 — SERVICES / BANNERS")
+    mark_stage_running(
+        stage
+    )
+
+    banner(
+        "05 — SERVICES / TLS"
+    )
 
     ips = read_lines(
-        DIRS["03_ips"] /
-        "ipv4.txt"
+        DIRS["03_ips"]
+        / "all-ips.txt"
     )
 
     subdomains = read_lines(
-        DIRS["01_subdomains"] /
-        "all-subdomains.txt"
+        DIRS["01_subdomains"]
+        / "all-subdomains.txt"
     )
 
     if ips and command_exists("nmap"):
 
         ip_file = (
-            DIRS[stage] /
-            "ips.txt"
+            DIRS[stage]
+            / "ips.txt"
         )
 
         save_unique(
@@ -1155,16 +1717,16 @@ def stage_services():
                 "-iL",
                 str(ip_file)
             ],
-            DIRS[stage] /
-            "nmap-service-detection.txt",
+            DIRS[stage]
+            / "nmap-service-detection.txt",
             7200
         )
 
     if subdomains and command_exists("tlsx"):
 
         hosts = (
-            DIRS[stage] /
-            "hosts.txt"
+            DIRS[stage]
+            / "hosts.txt"
         )
 
         save_unique(
@@ -1181,12 +1743,21 @@ def stage_services():
                 str(hosts),
                 "-silent"
             ],
-            DIRS[stage] /
-            "tls.txt",
-            3600
+            DIRS[stage]
+            / "tls.txt",
+            3600,
+            allow_failure=True
         )
 
-    mark_stage_done(stage)
+    report_section(
+        "05 — Services / TLS"
+    )
+
+    mark_stage_done(
+        stage
+    )
+
+    return True
 
 
 # ============================================================
@@ -1198,19 +1769,36 @@ def stage_http():
     stage = "06_http"
 
     if stage_done(stage):
-        log(f"[SKIP] {stage} já concluída")
-        return
+        log(
+            f"[SKIP] {stage} -> DONE"
+        )
+        return True
 
-    banner("06 — HTTP ENUMERATION")
-
-    subdomains = read_lines(
-        DIRS["01_subdomains"] /
-        "all-subdomains.txt"
+    mark_stage_running(
+        stage
     )
 
+    banner(
+        "06 — HTTP LIVE HOST DISCOVERY"
+    )
+
+    subdomains = read_lines(
+        DIRS["01_subdomains"]
+        / "all-subdomains.txt"
+    )
+
+    if not subdomains:
+
+        mark_stage_failed(
+            stage,
+            "no subdomains"
+        )
+
+        return False
+
     hosts = (
-        DIRS[stage] /
-        "hosts.txt"
+        DIRS[stage]
+        / "hosts.txt"
     )
 
     save_unique(
@@ -1218,29 +1806,105 @@ def stage_http():
         hosts
     )
 
-    if subdomains and command_exists("httpx"):
+    httpx_file = (
+        DIRS[stage]
+        / "httpx.txt"
+    )
 
-        run_cmd(
-            stage,
+    run_cmd(
+        stage,
+        "httpx",
+        [
             "httpx",
-            [
-                "httpx",
-                "-l",
-                str(hosts),
-                "-silent",
-                "-status-code",
-                "-title",
-                "-tech-detect",
-                "-web-server",
-                "-content-length",
-                "-follow-redirects"
-            ],
-            DIRS[stage] /
-            "httpx.txt",
-            7200
+            "-l",
+            str(hosts),
+            "-silent",
+            "-status-code",
+            "-title",
+            "-tech-detect",
+            "-web-server",
+            "-content-length",
+            "-follow-redirects"
+        ],
+        httpx_file,
+        7200
+    )
+
+    # --------------------------------------------------------
+    # Extrai somente URLs HTTP realmente retornadas
+    # --------------------------------------------------------
+
+    live_urls = set()
+
+    for line in read_lines(
+        httpx_file
+    ):
+
+        match = re.search(
+            r"https?://[^\s]+",
+            line
         )
 
-    mark_stage_done(stage)
+        if match:
+            live_urls.add(
+                match.group(0)
+            )
+
+    live_file = (
+        DIRS[stage]
+        / "live-urls.txt"
+    )
+
+    save_unique(
+        live_urls,
+        live_file
+    )
+
+    live_hosts = set()
+
+    for url in live_urls:
+
+        match = re.match(
+            r"https?://([^/:]+)",
+            url
+        )
+
+        if match:
+
+            host = normalize_hostname(
+                match.group(1)
+            )
+
+            if valid_target_hostname(
+                host
+            ):
+                live_hosts.add(
+                    host
+                )
+
+    save_unique(
+        live_hosts,
+        DIRS[stage]
+        / "live-hosts.txt"
+    )
+
+    report_section(
+        "06 — HTTP"
+    )
+
+    report_line(
+        f"**Live HTTP URLs:** `{len(live_urls)}`"
+    )
+
+    report_line(
+        f"**Live HTTP hosts:** `{len(live_hosts)}`"
+    )
+
+    mark_stage_done(
+        stage
+    )
+
+    return True
 
 
 # ============================================================
@@ -1252,48 +1916,65 @@ def stage_technologies():
     stage = "07_technologies"
 
     if stage_done(stage):
-        log(f"[SKIP] {stage} já concluída")
-        return
+        log(
+            f"[SKIP] {stage} -> DONE"
+        )
+        return True
 
-    banner("07 — TECHNOLOGY FINGERPRINTING")
+    mark_stage_running(
+        stage
+    )
 
-    subdomains = read_lines(
-        DIRS["01_subdomains"] /
-        "all-subdomains.txt"
+    banner(
+        "07 — TECHNOLOGY FINGERPRINTING"
+    )
+
+    live_hosts = read_lines(
+        DIRS["06_http"]
+        / "live-hosts.txt"
     )
 
     if command_exists("whatweb"):
 
-        for host in subdomains:
+        for index, host in enumerate(
+            live_hosts,
+            start=1
+        ):
 
             if STOP_REQUESTED:
-                return
+                return False
 
-            safe = re.sub(
-                r"[^A-Za-z0-9_.-]",
-                "_",
+            name = safe_name(
                 host
             )
 
             run_cmd(
                 stage,
-                f"whatweb-{safe}",
+                f"whatweb-{index}-{name}",
                 [
                     "whatweb",
                     "-a",
                     "1",
                     f"https://{host}"
                 ],
-                DIRS[stage] /
-                f"{safe}.txt",
-                180
+                DIRS[stage]
+                / f"{name}.txt",
+                300,
+                allow_failure=True
             )
 
-    if subdomains and command_exists("wafw00f"):
+    if live_hosts and command_exists(
+        "wafw00f"
+    ):
 
         hosts = (
-            DIRS["06_http"] /
-            "hosts.txt"
+            DIRS[stage]
+            / "hosts.txt"
+        )
+
+        save_unique(
+            live_hosts,
+            hosts
         )
 
         run_cmd(
@@ -1304,12 +1985,17 @@ def stage_technologies():
                 "-i",
                 str(hosts)
             ],
-            DIRS[stage] /
-            "wafw00f.txt",
-            3600
+            DIRS[stage]
+            / "wafw00f.txt",
+            3600,
+            allow_failure=True
         )
 
-    mark_stage_done(stage)
+    mark_stage_done(
+        stage
+    )
+
+    return True
 
 
 # ============================================================
@@ -1321,29 +2007,52 @@ def stage_urls():
     stage = "08_urls"
 
     if stage_done(stage):
-        log(f"[SKIP] {stage} já concluída")
-        return
+        log(
+            f"[SKIP] {stage} -> DONE"
+        )
+        return True
 
-    banner("08 — URL DISCOVERY")
-
-    subdomains = read_lines(
-        DIRS["01_subdomains"] /
-        "all-subdomains.txt"
+    mark_stage_running(
+        stage
     )
 
+    banner(
+        "08 — URL DISCOVERY"
+    )
+
+    live_hosts = read_lines(
+        DIRS["06_http"]
+        / "live-hosts.txt"
+    )
+
+    if not live_hosts:
+
+        log(
+            "[URL] Nenhum host HTTP vivo."
+        )
+
+        mark_stage_failed(
+            stage,
+            "no live HTTP hosts"
+        )
+
+        return False
+
     hosts = (
-        DIRS[stage] /
-        "hosts.txt"
+        DIRS[stage]
+        / "hosts.txt"
     )
 
     save_unique(
-        subdomains,
+        live_hosts,
         hosts
     )
 
-    url_sources = set()
+    urls = set()
 
-    # katana
+    # --------------------------------------------------------
+    # KATANA
+    # --------------------------------------------------------
 
     out = run_cmd(
         stage,
@@ -1357,17 +2066,19 @@ def stage_urls():
             "3",
             "-jc"
         ],
-        DIRS[stage] /
-        "katana.txt",
+        DIRS[stage]
+        / "katana.txt",
         7200
     )
 
-    url_sources.update(
+    urls.update(
         x for x in clean_lines(out)
         if x.startswith("http")
     )
 
-    # urlfinder
+    # --------------------------------------------------------
+    # URLFINDER
+    # --------------------------------------------------------
 
     out = run_cmd(
         stage,
@@ -1378,115 +2089,180 @@ def stage_urls():
             str(hosts),
             "-silent"
         ],
-        DIRS[stage] /
-        "urlfinder.txt",
-        7200
+        DIRS[stage]
+        / "urlfinder.txt",
+        7200,
+        allow_failure=True
     )
 
-    url_sources.update(
+    urls.update(
         x for x in clean_lines(out)
         if x.startswith("http")
     )
 
-    # waybackurls
+    # --------------------------------------------------------
+    # WAYBACKURLS
+    # --------------------------------------------------------
 
     out = run_cmd(
         stage,
         "waybackurls",
         [
-            "bash",
-            "-c",
-            f"printf '%s\\n' '{TARGET}' | waybackurls"
+            "waybackurls"
         ],
-        DIRS[stage] /
-        "waybackurls.txt",
-        3600
+        DIRS[stage]
+        / "waybackurls.txt",
+        3600,
+        stdin_text="\n".join(
+            live_hosts
+        ) + "\n",
+        allow_failure=True
     )
 
-    url_sources.update(
+    urls.update(
         x for x in clean_lines(out)
         if x.startswith("http")
     )
 
-    # gau
+    # --------------------------------------------------------
+    # GAU
+    # --------------------------------------------------------
 
     out = run_cmd(
         stage,
         "gau",
         [
             "gau",
+            "--threads",
+            str(THREADS),
             TARGET
         ],
-        DIRS[stage] /
-        "gau.txt",
-        3600
+        DIRS[stage]
+        / "gau.txt",
+        3600,
+        allow_failure=True
     )
 
-    url_sources.update(
+    urls.update(
         x for x in clean_lines(out)
         if x.startswith("http")
     )
 
-    # hakrawler
+    # --------------------------------------------------------
+    # HAKRAWLER
+    # --------------------------------------------------------
 
-    out = run_cmd(
-        stage,
-        "hakrawler",
-        [
-            "bash",
-            "-c",
-            f"printf '%s\\n' '{TARGET}' | hakrawler"
-        ],
-        DIRS[stage] /
-        "hakrawler.txt",
-        3600
-    )
+    for index, host in enumerate(
+        live_hosts,
+        start=1
+    ):
 
-    url_sources.update(
-        x for x in clean_lines(out)
-        if x.startswith("http")
-    )
+        if STOP_REQUESTED:
+            return False
 
-    # gospider
+        out = run_cmd(
+            stage,
+            f"hakrawler-{index}",
+            [
+                "hakrawler",
+                "-url",
+                f"https://{host}"
+            ],
+            DIRS[stage]
+            / f"hakrawler-{index}.txt",
+            3600,
+            allow_failure=True
+        )
 
-    out = run_cmd(
-        stage,
-        "gospider",
-        [
-            "gospider",
-            "-s",
-            f"https://{TARGET}",
-            "-c",
-            str(THREADS),
-            "-t",
-            str(THREADS),
-            "--quiet"
-        ],
-        DIRS[stage] /
-        "gospider.txt",
-        7200
-    )
+        urls.update(
+            x for x in clean_lines(out)
+            if x.startswith("http")
+        )
 
-    url_sources.update(
-        x for x in clean_lines(out)
-        if x.startswith("http")
+    # --------------------------------------------------------
+    # GOSPIDER
+    # --------------------------------------------------------
+
+    for index, host in enumerate(
+        live_hosts,
+        start=1
+    ):
+
+        if STOP_REQUESTED:
+            return False
+
+        out = run_cmd(
+            stage,
+            f"gospider-{index}",
+            [
+                "gospider",
+                "-s",
+                f"https://{host}",
+                "-c",
+                str(THREADS),
+                "-t",
+                str(THREADS),
+                "--quiet"
+            ],
+            DIRS[stage]
+            / f"gospider-{index}.txt",
+            7200,
+            allow_failure=True
+        )
+
+        urls.update(
+            x for x in clean_lines(out)
+            if x.startswith("http")
+        )
+
+    # --------------------------------------------------------
+    # AGREGAÇÃO
+    # --------------------------------------------------------
+
+    all_urls = (
+        DIRS[stage]
+        / "all-urls.txt"
     )
 
     save_unique(
-        url_sources,
-        DIRS[stage] /
-        "all-urls.txt"
+        urls,
+        all_urls
     )
+
+    # --------------------------------------------------------
+    # ANEW
+    # --------------------------------------------------------
+
+    if command_exists("anew"):
+
+        run_cmd(
+            stage,
+            "anew-url-consolidation",
+            [
+                "anew",
+                str(all_urls)
+            ],
+            None,
+            1800,
+            stdin_text="\n".join(
+                sorted(urls)
+            ) + "\n",
+            allow_failure=True
+        )
 
     report_section(
         "08 — URL Discovery"
     )
 
     report_line(
-        f"**URLs:** `{len(url_sources)}`"
+        f"**URLs:** `{len(read_lines(all_urls))}`"
     )
 
-    mark_stage_done(stage)
+    mark_stage_done(
+        stage
+    )
+
+    return True
 
 
 # ============================================================
@@ -1498,18 +2274,27 @@ def stage_endpoints():
     stage = "09_endpoints"
 
     if stage_done(stage):
-        log(f"[SKIP] {stage} já concluída")
-        return
+        log(
+            f"[SKIP] {stage} -> DONE"
+        )
+        return True
 
-    banner("09 — ENDPOINT EXTRACTION")
+    mark_stage_running(
+        stage
+    )
+
+    banner(
+        "09 — ENDPOINT EXTRACTION"
+    )
 
     urls = read_lines(
-        DIRS["08_urls"] /
-        "all-urls.txt"
+        DIRS["08_urls"]
+        / "all-urls.txt"
     )
 
     endpoints = set()
     api_candidates = set()
+    javascript = set()
 
     for url in urls:
 
@@ -1519,12 +2304,25 @@ def stage_endpoints():
         )
 
         if match and match.group(1):
+
             path = match.group(1)
 
-            if path not in ("", "/"):
-                endpoints.add(path)
+            if path not in (
+                "",
+                "/"
+            ):
+                endpoints.add(
+                    path
+                )
 
         lower = url.lower()
+
+        if lower.endswith(
+            ".js"
+        ):
+            javascript.add(
+                url
+            )
 
         if any(
             marker in lower
@@ -1537,21 +2335,29 @@ def stage_endpoints():
                 ".json",
                 ".xml",
                 ".yaml",
-                ".yml"
+                ".yml",
             ]
         ):
-            api_candidates.add(url)
+            api_candidates.add(
+                url
+            )
 
     save_unique(
         endpoints,
-        DIRS[stage] /
-        "endpoints.txt"
+        DIRS[stage]
+        / "endpoints.txt"
     )
 
     save_unique(
         api_candidates,
-        DIRS[stage] /
-        "api-candidates.txt"
+        DIRS[stage]
+        / "api-candidates.txt"
+    )
+
+    save_unique(
+        javascript,
+        DIRS[stage]
+        / "javascript.txt"
     )
 
     report_section(
@@ -1563,14 +2369,22 @@ def stage_endpoints():
     )
 
     report_line(
-        f"**Possíveis APIs:** `{len(api_candidates)}`"
+        f"**API candidates:** `{len(api_candidates)}`"
     )
 
-    mark_stage_done(stage)
+    report_line(
+        f"**JavaScript URLs:** `{len(javascript)}`"
+    )
+
+    mark_stage_done(
+        stage
+    )
+
+    return True
 
 
 # ============================================================
-# 10 — ARQUIVOS
+# 10 — FILES / .GIT / .ENV
 # ============================================================
 
 def stage_files():
@@ -1578,20 +2392,32 @@ def stage_files():
     stage = "10_files"
 
     if stage_done(stage):
-        log(f"[SKIP] {stage} já concluída")
-        return
+        log(
+            f"[SKIP] {stage} -> DONE"
+        )
+        return True
+
+    mark_stage_running(
+        stage
+    )
 
     banner(
-        "10 — FILE DISCOVERY "
-        "(.git / .env / BACKUPS / CONFIG)"
+        "10 — FILE / CONFIGURATION EXPOSURE"
     )
 
     urls = read_lines(
-        DIRS["08_urls"] /
-        "all-urls.txt"
+        DIRS["08_urls"]
+        / "all-urls.txt"
     )
 
-    interesting_extensions = {
+    live_urls = read_lines(
+        DIRS["06_http"]
+        / "live-urls.txt"
+    )
+
+    interesting = set()
+
+    extensions = {
         ".js",
         ".json",
         ".xml",
@@ -1604,6 +2430,9 @@ def stage_files():
         ".tar",
         ".gz",
         ".tgz",
+        ".bz2",
+        ".7z",
+        ".rar",
         ".bak",
         ".old",
         ".backup",
@@ -1617,71 +2446,93 @@ def stage_files():
         ".toml",
     }
 
-    # Arquivos diretamente observados nas URLs
-    interesting = set()
-
     for url in urls:
 
-        clean = url.lower().split("?")[0]
+        clean = url.lower().split(
+            "?",
+            1
+        )[0]
 
         if any(
             clean.endswith(ext)
-            for ext in interesting_extensions
+            for ext in extensions
         ):
-            interesting.add(url)
+            interesting.add(
+                url
+            )
 
     save_unique(
         interesting,
-        DIRS[stage] /
-        "interesting-files.txt"
+        DIRS[stage]
+        / "interesting-files.txt"
     )
 
     # --------------------------------------------------------
-    # WORDLIST ESPECÍFICA PARA ARQUIVOS
+    # WORDLIST FILE FUZZING
     # --------------------------------------------------------
 
-    file_wordlists = wordlist_paths("files")
+    file_wordlists = wordlist_paths(
+        "files"
+    )
 
-    if file_wordlists and command_exists("ffuf"):
+    live_hosts = read_lines(
+        DIRS["06_http"]
+        / "live-hosts.txt"
+    )
 
-        # Cada wordlist continua em seu local original.
-        # O FFUF recebe diretamente o caminho.
-        for index, wordlist in enumerate(
-            file_wordlists,
+    if (
+        file_wordlists
+        and live_hosts
+        and command_exists("ffuf")
+    ):
+
+        for host_index, host in enumerate(
+            live_hosts,
             start=1
         ):
 
-            run_cmd(
-                stage,
-                f"ffuf-files-{index}",
-                [
-                    "ffuf",
-                    "-u",
-                    f"https://{TARGET}/FUZZ",
-                    "-w",
-                    str(wordlist),
-                    "-mc",
-                    "200,204,301,302,307,308,401,403",
-                    "-t",
-                    str(THREADS),
-                    "-of",
-                    "json",
-                    "-o",
-                    str(
-                        DIRS[stage] /
-                        f"ffuf-files-{index}.json"
-                    ),
-                    "-s"
-                ],
-                None,
-                7200
-            )
+            for wl_index, wordlist in enumerate(
+                file_wordlists,
+                start=1
+            ):
+
+                if STOP_REQUESTED:
+                    return False
+
+                output_json = (
+                    DIRS[stage]
+                    / f"ffuf-files-{host_index}-{wl_index}.json"
+                )
+
+                run_cmd(
+                    stage,
+                    f"ffuf-files-{host_index}-{wl_index}",
+                    [
+                        "ffuf",
+                        "-u",
+                        f"https://{host}/FUZZ",
+                        "-w",
+                        str(wordlist),
+                        "-mc",
+                        "200,204,301,302,307,308,401,403",
+                        "-t",
+                        str(THREADS),
+                        "-of",
+                        "json",
+                        "-o",
+                        str(output_json),
+                        "-s"
+                    ],
+                    None,
+                    7200,
+                    allow_failure=True
+                )
 
     # --------------------------------------------------------
-    # .git
+    # .GIT
     # --------------------------------------------------------
 
-    git_targets = [
+    git_paths = [
         ".git",
         ".git/",
         ".git/HEAD",
@@ -1689,28 +2540,37 @@ def stage_files():
         ".git/index",
         ".git/logs/HEAD",
         ".git/description",
+        ".git/packed-refs",
         ".gitignore",
     ]
 
+    git_candidates = set()
+
+    for base in live_urls:
+
+        base = base.rstrip("/")
+
+        for item in git_paths:
+
+            git_candidates.add(
+                f"{base}/{item}"
+            )
+
     git_file = (
-        DIRS[stage] /
-        "git-candidates.txt"
+        DIRS[stage]
+        / "git-candidates.txt"
     )
 
-    write_file(
-        git_file,
-        "\n".join(
-            f"https://{TARGET}/{x}"
-            for x in git_targets
-        ) +
-        "\n"
+    save_unique(
+        git_candidates,
+        git_file
     )
 
     # --------------------------------------------------------
-    # .env
+    # .ENV
     # --------------------------------------------------------
 
-    env_targets = [
+    env_paths = [
         ".env",
         ".env/",
         ".env.local",
@@ -1726,18 +2586,60 @@ def stage_files():
         ".env.sample",
     ]
 
+    env_candidates = set()
+
+    for base in live_urls:
+
+        base = base.rstrip("/")
+
+        for item in env_paths:
+
+            env_candidates.add(
+                f"{base}/{item}"
+            )
+
     env_file = (
-        DIRS[stage] /
-        "env-candidates.txt"
+        DIRS[stage]
+        / "env-candidates.txt"
     )
 
-    write_file(
-        env_file,
-        "\n".join(
-            f"https://{TARGET}/{x}"
-            for x in env_targets
-        ) +
-        "\n"
+    save_unique(
+        env_candidates,
+        env_file
+    )
+
+    # --------------------------------------------------------
+    # OUTROS ARQUIVOS SENSÍVEIS
+    # --------------------------------------------------------
+
+    sensitive_paths = [
+        "robots.txt",
+        "sitemap.xml",
+        "security.txt",
+        ".well-known/security.txt",
+        "crossdomain.xml",
+        "clientaccesspolicy.xml",
+        "phpinfo.php",
+        "server-status",
+        "server-info",
+    ]
+
+    sensitive_candidates = set()
+
+    for base in live_urls:
+
+        base = base.rstrip("/")
+
+        for item in sensitive_paths:
+
+            sensitive_candidates.add(
+                f"{base}/{item}"
+            )
+
+    save_unique(
+        sensitive_candidates,
+        DIRS[stage]
+        / "special-files.txt"
     )
 
     report_section(
@@ -1745,69 +2647,84 @@ def stage_files():
     )
 
     report_line(
-        f"**Arquivos interessantes observados:** "
-        f"`{len(interesting)}`"
+        f"**Interesting files from URLs:** `{len(interesting)}`"
     )
 
     report_line(
-        "**Classes especiais verificadas:** "
-        "`.git`, `.git/config`, `.git/HEAD`, "
-        "`.gitignore`, `.env`, `.env.local`, "
-        "`.env.production`, backups e source maps."
+        f"**.git candidates:** `{len(git_candidates)}`"
     )
 
-    mark_stage_done(stage)
+    report_line(
+        f"**.env candidates:** `{len(env_candidates)}`"
+    )
+
+    report_line(
+        f"**Special files:** `{len(sensitive_candidates)}`"
+    )
+
+    report_line(
+        "Explicit checks generated for `.git`, `.git/config`, "
+        "`.git/HEAD`, `.gitignore`, `.env`, `.env.local`, "
+        "`.env.production`, backups and source maps."
+    )
+
+    mark_stage_done(
+        stage
+    )
+
+    return True
 
 
 # ============================================================
-# 11 — DIRETÓRIOS
+# EXTRAIR TARGETS HTTP
 # ============================================================
 
 def extract_http_targets():
 
     result = []
 
-    httpx_file = (
-        DIRS["06_http"] /
-        "httpx.txt"
+    live_file = (
+        DIRS["06_http"]
+        / "live-urls.txt"
     )
 
-    for line in read_lines(httpx_file):
+    for url in read_lines(
+        live_file
+    ):
 
         match = re.match(
-            r"(https?://[^\s]+)",
-            line
+            r"(https?://[^/\s]+)",
+            url
         )
 
         if match:
+
             result.append(
                 match.group(1)
             )
-
-    if not result:
-
-        subdomains = read_lines(
-            DIRS["01_subdomains"] /
-            "all-subdomains.txt"
-        )
-
-        result = [
-            f"https://{x}"
-            for x in subdomains
-        ]
 
     return sorted(
         set(result)
     )
 
 
+# ============================================================
+# 11 — DIRETÓRIOS
+# ============================================================
+
 def stage_directories():
 
     stage = "11_directories"
 
     if stage_done(stage):
-        log(f"[SKIP] {stage} já concluída")
-        return
+        log(
+            f"[SKIP] {stage} -> DONE"
+        )
+        return True
+
+    mark_stage_running(
+        stage
+    )
 
     banner(
         "11 — DIRECTORY / FILE ENUMERATION"
@@ -1815,19 +2732,35 @@ def stage_directories():
 
     targets = extract_http_targets()
 
-    web_lists = wordlist_paths("web")
+    if not targets:
 
-    if not web_lists:
         log(
-            "[WORDLIST] Nenhuma wordlist web encontrada."
+            "[DIRECTORIES] Nenhum HTTP target vivo."
         )
 
-        mark_stage_done(stage)
-        return
+        mark_stage_failed(
+            stage,
+            "no live HTTP targets"
+        )
 
-    # IMPORTANTE:
-    # As ferramentas recebem os caminhos originais.
-    # Não há cópia para dentro do alvo.
+        return False
+
+    web_lists = wordlist_paths(
+        "web"
+    )
+
+    if not web_lists:
+
+        log(
+            "[WORDLIST] Nenhuma wordlist web."
+        )
+
+        mark_stage_failed(
+            stage,
+            "no web wordlists"
+        )
+
+        return False
 
     for target_index, base in enumerate(
         targets,
@@ -1835,11 +2768,9 @@ def stage_directories():
     ):
 
         if STOP_REQUESTED:
-            return
+            return False
 
-        safe_name = re.sub(
-            r"[^A-Za-z0-9_.-]",
-            "_",
+        target_name = safe_name(
             base
         )
 
@@ -1871,13 +2802,14 @@ def stage_directories():
                         "json",
                         "-o",
                         str(
-                            DIRS[stage] /
-                            f"ffuf_{safe_name}_{wl_index}.json"
+                            DIRS[stage]
+                            / f"ffuf_{target_name}_{wl_index}.json"
                         ),
                         "-s"
                     ],
                     None,
-                    7200
+                    7200,
+                    allow_failure=True
                 )
 
         # ----------------------------------------------------
@@ -1905,12 +2837,13 @@ def stage_directories():
                         "--silent",
                         "-o",
                         str(
-                            DIRS[stage] /
-                            f"ferox_{safe_name}_{wl_index}.txt"
+                            DIRS[stage]
+                            / f"ferox_{target_name}_{wl_index}.txt"
                         )
                     ],
                     None,
-                    7200
+                    7200,
+                    allow_failure=True
                 )
 
         # ----------------------------------------------------
@@ -1938,13 +2871,14 @@ def stage_directories():
                         str(THREADS),
                         "-o",
                         str(
-                            DIRS[stage] /
-                            f"gobuster_{safe_name}_{wl_index}.txt"
+                            DIRS[stage]
+                            / f"gobuster_{target_name}_{wl_index}.txt"
                         ),
                         "--no-error"
                     ],
                     None,
-                    7200
+                    7200,
+                    allow_failure=True
                 )
 
         # ----------------------------------------------------
@@ -1953,7 +2887,6 @@ def stage_directories():
 
         if command_exists("dirsearch"):
 
-            # dirsearch aceita wordlist individual.
             for wl_index, wordlist in enumerate(
                 web_lists,
                 start=1
@@ -1972,15 +2905,20 @@ def stage_directories():
                         "plain",
                         "--output",
                         str(
-                            DIRS[stage] /
-                            f"dirsearch_{safe_name}_{wl_index}.txt"
+                            DIRS[stage]
+                            / f"dirsearch_{target_name}_{wl_index}.txt"
                         )
                     ],
                     None,
-                    7200
+                    7200,
+                    allow_failure=True
                 )
 
-    mark_stage_done(stage)
+    mark_stage_done(
+        stage
+    )
+
+    return True
 
 
 # ============================================================
@@ -1992,8 +2930,14 @@ def stage_vulnerabilities():
     stage = "12_vulnerabilities"
 
     if stage_done(stage):
-        log(f"[SKIP] {stage} já concluída")
-        return
+        log(
+            f"[SKIP] {stage} -> DONE"
+        )
+        return True
+
+    mark_stage_running(
+        stage
+    )
 
     banner(
         "12 — VULNERABILITY / EXPOSURE DISCOVERY"
@@ -2001,9 +2945,22 @@ def stage_vulnerabilities():
 
     targets = extract_http_targets()
 
+    if not targets:
+
+        log(
+            "[VULN] Nenhum HTTP target vivo."
+        )
+
+        mark_stage_failed(
+            stage,
+            "no live HTTP targets"
+        )
+
+        return False
+
     targets_file = (
-        DIRS[stage] /
-        "http-targets.txt"
+        DIRS[stage]
+        / "http-targets.txt"
     )
 
     save_unique(
@@ -2015,38 +2972,41 @@ def stage_vulnerabilities():
     # NUCLEI
     # --------------------------------------------------------
 
-    if targets:
-
-        run_cmd(
-            stage,
+    run_cmd(
+        stage,
+        "nuclei",
+        [
             "nuclei",
-            [
-                "nuclei",
-                "-l",
-                str(targets_file),
-                "-silent",
-                "-severity",
-                "info,low,medium,high,critical",
-                "-o",
-                str(
-                    DIRS[stage] /
-                    "nuclei.txt"
-                )
-            ],
-            None,
-            14400
-        )
+            "-l",
+            str(targets_file),
+            "-silent",
+            "-severity",
+            "info,low,medium,high,critical",
+            "-o",
+            str(
+                DIRS[stage]
+                / "nuclei.txt"
+            )
+        ],
+        None,
+        14400,
+        allow_failure=True
+    )
 
     # --------------------------------------------------------
     # DALFOX
     # --------------------------------------------------------
 
     urls_file = (
-        DIRS["08_urls"] /
-        "all-urls.txt"
+        DIRS["08_urls"]
+        / "all-urls.txt"
     )
 
-    if command_exists("dalfox") and urls_file.exists():
+    if (
+        command_exists("dalfox")
+        and urls_file.exists()
+        and urls_file.stat().st_size > 0
+    ):
 
         run_cmd(
             stage,
@@ -2058,12 +3018,13 @@ def stage_vulnerabilities():
                 "--silence",
                 "--output",
                 str(
-                    DIRS[stage] /
-                    "dalfox.txt"
+                    DIRS[stage]
+                    / "dalfox.txt"
                 )
             ],
             None,
-            14400
+            14400,
+            allow_failure=True
         )
 
     # --------------------------------------------------------
@@ -2073,8 +3034,8 @@ def stage_vulnerabilities():
     if command_exists("nikto"):
 
         nikto_dir = (
-            DIRS[stage] /
-            "nikto"
+            DIRS[stage]
+            / "nikto"
         )
 
         nikto_dir.mkdir(
@@ -2088,11 +3049,9 @@ def stage_vulnerabilities():
         ):
 
             if STOP_REQUESTED:
-                return
+                return False
 
-            safe = re.sub(
-                r"[^A-Za-z0-9_.-]",
-                "_",
+            name = safe_name(
                 base
             )
 
@@ -2104,12 +3063,37 @@ def stage_vulnerabilities():
                     "-h",
                     base
                 ],
-                nikto_dir /
-                f"{safe}.txt",
-                3600
+                nikto_dir
+                / f"{name}.txt",
+                3600,
+                allow_failure=True
             )
 
-    mark_stage_done(stage)
+    # --------------------------------------------------------
+    # UNCover
+    # --------------------------------------------------------
+
+    if command_exists("uncover"):
+
+        run_cmd(
+            stage,
+            "uncover",
+            [
+                "uncover",
+                "-q",
+                TARGET
+            ],
+            DIRS[stage]
+            / "uncover.txt",
+            3600,
+            allow_failure=True
+        )
+
+    mark_stage_done(
+        stage
+    )
+
+    return True
 
 
 # ============================================================
@@ -2122,98 +3106,162 @@ def stage_consolidation():
 
     if stage_done(stage):
         log(
-            f"[SKIP] {stage} já concluída"
+            f"[SKIP] {stage} -> DONE"
         )
-        return
+        return True
+
+    mark_stage_running(
+        stage
+    )
 
     banner(
-        "13 — CONSOLIDATION"
+        "13 — FINAL CONSOLIDATION"
     )
 
-    subdomain_count = len(
-        read_lines(
-            DIRS["01_subdomains"] /
-            "all-subdomains.txt"
-        )
-    )
+    counts = {
+        "Subdomains": len(
+            read_lines(
+                DIRS["01_subdomains"]
+                / "all-subdomains.txt"
+            )
+        ),
 
-    ip_count = len(
-        read_lines(
-            DIRS["03_ips"] /
-            "ipv4.txt"
-        )
-    )
+        "Resolved hosts": len(
+            read_lines(
+                DIRS["02_dns"]
+                / "resolved-hosts.txt"
+            )
+        ),
 
-    url_count = len(
-        read_lines(
-            DIRS["08_urls"] /
-            "all-urls.txt"
-        )
-    )
+        "IPv4": len(
+            read_lines(
+                DIRS["03_ips"]
+                / "all-ips.txt"
+            )
+        ),
 
-    endpoint_count = len(
-        read_lines(
-            DIRS["09_endpoints"] /
-            "endpoints.txt"
-        )
-    )
+        "Live HTTP hosts": len(
+            read_lines(
+                DIRS["06_http"]
+                / "live-hosts.txt"
+            )
+        ),
 
-    api_count = len(
-        read_lines(
-            DIRS["09_endpoints"] /
-            "api-candidates.txt"
-        )
-    )
+        "Live HTTP URLs": len(
+            read_lines(
+                DIRS["06_http"]
+                / "live-urls.txt"
+            )
+        ),
 
-    file_count = len(
-        read_lines(
-            DIRS["10_files"] /
-            "interesting-files.txt"
-        )
-    )
+        "URLs": len(
+            read_lines(
+                DIRS["08_urls"]
+                / "all-urls.txt"
+            )
+        ),
+
+        "Endpoints": len(
+            read_lines(
+                DIRS["09_endpoints"]
+                / "endpoints.txt"
+            )
+        ),
+
+        "API candidates": len(
+            read_lines(
+                DIRS["09_endpoints"]
+                / "api-candidates.txt"
+            )
+        ),
+
+        "JavaScript": len(
+            read_lines(
+                DIRS["09_endpoints"]
+                / "javascript.txt"
+            )
+        ),
+
+        "Interesting files": len(
+            read_lines(
+                DIRS["10_files"]
+                / "interesting-files.txt"
+            )
+        ),
+
+        ".git candidates": len(
+            read_lines(
+                DIRS["10_files"]
+                / "git-candidates.txt"
+            )
+        ),
+
+        ".env candidates": len(
+            read_lines(
+                DIRS["10_files"]
+                / "env-candidates.txt"
+            )
+        ),
+    }
 
     report_section(
         "13 — Consolidated Summary"
     )
 
     report_line(
-        f"""
-| Categoria | Quantidade |
-|---|---:|
-| Subdomínios | {subdomain_count} |
-| IPv4 | {ip_count} |
-| URLs | {url_count} |
-| Endpoints | {endpoint_count} |
-| Possíveis APIs | {api_count} |
-| Arquivos interessantes | {file_count} |
-"""
+        "| Category | Count |"
     )
 
     report_line(
-        f"""
-### Evidências
+        "|---|---:|"
+    )
 
-- Wordlists: `{DIRS["00_wordlists"]}`
-- Subdomínios: `{DIRS["01_subdomains"]}`
-- DNS: `{DIRS["02_dns"]}`
-- IPs: `{DIRS["03_ips"]}`
-- Portas: `{DIRS["04_ports"]}`
-- Serviços: `{DIRS["05_services"]}`
-- HTTP: `{DIRS["06_http"]}`
-- Tecnologias: `{DIRS["07_technologies"]}`
-- URLs: `{DIRS["08_urls"]}`
-- Endpoints: `{DIRS["09_endpoints"]}`
-- Arquivos: `{DIRS["10_files"]}`
-- Diretórios: `{DIRS["11_directories"]}`
-- Vulnerabilidades: `{DIRS["12_vulnerabilities"]}`
-"""
+    for category, count in counts.items():
+
+        report_line(
+            f"| {category} | {count} |"
+        )
+
+    report_line(
+        ""
     )
 
     report_line(
-        f"\nRecon finalizado: `{now()}`"
+        "## Evidence Directories"
     )
 
-    mark_stage_done(stage)
+    for name, path in DIRS.items():
+
+        report_line(
+            f"- `{name}` → `{path}`"
+        )
+
+    report_line(
+        ""
+    )
+
+    report_line(
+        "## Wordlist Policy"
+    )
+
+    report_line(
+        "Wordlists are referenced directly from their original "
+        "locations and are not copied into the target directory."
+    )
+
+    report_line(
+        ""
+    )
+
+    report_line(
+        f"**Completed:** `{now()}`"
+    )
+
+    mark_stage_done(
+        stage
+    )
+
+    return True
 
 
 # ============================================================
@@ -2223,6 +3271,7 @@ def stage_consolidation():
 def tool_status():
 
     tools = [
+        # Subdomains / DNS
         "subfinder",
         "amass",
         "chaos-client",
@@ -2235,12 +3284,14 @@ def tool_status():
         "findomain",
         "sublist3r",
 
+        # Network
         "httpx",
         "naabu",
         "nmap",
         "masscan",
         "tlsx",
 
+        # URLs
         "katana",
         "urlfinder",
         "waybackurls",
@@ -2248,19 +3299,23 @@ def tool_status():
         "hakrawler",
         "gospider",
 
+        # Content
         "ffuf",
         "feroxbuster",
         "gobuster",
         "dirsearch",
 
+        # Fingerprinting
         "whatweb",
         "wafw00f",
-        "nikto",
 
+        # Vulnerability
         "nuclei",
         "dalfox",
+        "nikto",
         "uncover",
 
+        # Utility
         "jq",
         "anew",
     ]
@@ -2269,18 +3324,77 @@ def tool_status():
         "FERRAMENTAS DISPONÍVEIS"
     )
 
+    available = 0
+    missing = 0
+
     for tool in tools:
 
-        path = shutil.which(tool)
+        path = shutil.which(
+            tool
+        )
 
         if path:
+
+            available += 1
+
             print(
-                f"[OK]       {tool:<18} {path}"
+                f"[OK]       {tool:<20} {path}"
             )
+
         else:
+
+            missing += 1
+
             print(
-                f"[AUSENTE]  {tool:<18}"
+                f"[AUSENTE]  {tool:<20}"
             )
+
+    print()
+
+    log(
+        f"[TOOLS] disponíveis={available} "
+        f"ausentes={missing}"
+    )
+
+    print()
+
+
+# ============================================================
+# STATUS DO PIPELINE
+# ============================================================
+
+def pipeline_status():
+
+    banner(
+        "CHECKPOINT STATUS"
+    )
+
+    for stage in [
+        "01_subdomains",
+        "02_dns",
+        "03_ips",
+        "04_ports",
+        "05_services",
+        "06_http",
+        "07_technologies",
+        "08_urls",
+        "09_endpoints",
+        "10_files",
+        "11_directories",
+        "12_vulnerabilities",
+        "13_consolidation",
+    ]:
+
+        status = stage_status(
+            stage
+        )
+
+        if status is None:
+            status = "NOT_STARTED"
+
+        print(
+            f"{stage:<24} {status}"
+        )
 
     print()
 
@@ -2301,49 +3415,129 @@ def main():
         f"OUTPUT: {BASE_DIR}"
     )
 
+    log(
+        "Modelo: execução sequencial"
+    )
+
+    log(
+        "Checkpoint: individual por ferramenta"
+    )
+
+    log(
+        "Wordlists: referência direta, sem cópia"
+    )
+
+    log(
+        "Port scan: somente IPs resolvidos"
+    )
+
+    log(
+        "HTTP pipeline: somente hosts vivos"
+    )
+
     tool_status()
+
+    pipeline_status()
 
     prepare_wordlist_references()
 
     # ========================================================
-    # EXECUÇÃO SEQUENCIAL
+    # PIPELINE SEQUENCIAL
     # ========================================================
 
     stages = [
-        ("01_subdomains", stage_subdomains),
-        ("02_dns", stage_dns),
-        ("03_ips", stage_ips),
-        ("04_ports", stage_ports),
-        ("05_services", stage_services),
-        ("06_http", stage_http),
-        ("07_technologies", stage_technologies),
-        ("08_urls", stage_urls),
-        ("09_endpoints", stage_endpoints),
-        ("10_files", stage_files),
-        ("11_directories", stage_directories),
-        ("12_vulnerabilities", stage_vulnerabilities),
-        ("13_consolidation", stage_consolidation),
+        (
+            "01_subdomains",
+            stage_subdomains
+        ),
+        (
+            "02_dns",
+            stage_dns
+        ),
+        (
+            "03_ips",
+            stage_ips
+        ),
+        (
+            "04_ports",
+            stage_ports
+        ),
+        (
+            "05_services",
+            stage_services
+        ),
+        (
+            "06_http",
+            stage_http
+        ),
+        (
+            "07_technologies",
+            stage_technologies
+        ),
+        (
+            "08_urls",
+            stage_urls
+        ),
+        (
+            "09_endpoints",
+            stage_endpoints
+        ),
+        (
+            "10_files",
+            stage_files
+        ),
+        (
+            "11_directories",
+            stage_directories
+        ),
+        (
+            "12_vulnerabilities",
+            stage_vulnerabilities
+        ),
+        (
+            "13_consolidation",
+            stage_consolidation
+        ),
     ]
 
-    for name, function in stages:
+    for stage_name, function in stages:
 
         if STOP_REQUESTED:
             break
 
-        if stage_done(name):
+        if stage_done(stage_name):
+
             log(
-                f"[SKIP] {name} -> DONE"
+                f"[SKIP] {stage_name} -> DONE"
             )
+
             continue
 
-        log(
-            f"[START] {name}"
+        banner(
+            f"INICIANDO ETAPA {stage_name}"
         )
 
-        function()
+        success = function()
 
         if STOP_REQUESTED:
             break
+
+        if not success:
+
+            log(
+                f"[STOP] {stage_name} não foi concluída."
+            )
+
+            log(
+                "O pipeline não avançará para a próxima "
+                "etapa até esta etapa ser concluída."
+            )
+
+            break
+
+        log(
+            f"[COMPLETE] {stage_name}"
+        )
 
     # ========================================================
     # FINAL
@@ -2352,19 +3546,19 @@ def main():
     save_checkpoint()
 
     banner(
-        "PIPELINE FINALIZADO / INTERROMPIDO"
+        "DEEP RECON — FINAL"
     )
 
     log(
-        f"TARGET: {TARGET}"
+        f"TARGET:     {TARGET}"
     )
 
     log(
-        f"OUTPUT: {BASE_DIR}"
+        f"OUTPUT:     {BASE_DIR}"
     )
 
     log(
-        f"REPORT: {REPORT}"
+        f"REPORT:     {REPORT}"
     )
 
     log(
@@ -2372,13 +3566,31 @@ def main():
     )
 
     if STOP_REQUESTED:
+
         log(
-            "STATUS: INTERROMPIDO — "
-            "próxima execução continuará pelo checkpoint."
+            "STATUS: INTERRUPTED"
         )
-    else:
+
         log(
-            "STATUS: CONCLUÍDO"
+            "A próxima execução retomará pelo checkpoint."
+        )
+
+    elif stage_done(
+        "13_consolidation"
+    ):
+
+        log(
+            "STATUS: COMPLETED"
+        )
+
+    else:
+
+        log(
+            "STATUS: PAUSED / INCOMPLETE"
+        )
+
+        log(
+            "Execute novamente para retomar."
         )
 
 
